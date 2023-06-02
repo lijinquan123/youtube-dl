@@ -123,6 +123,43 @@ if compat_os_name == 'nt':
     import ctypes
 
 
+def rank(x):
+    score = 0
+    # 优先编码
+    vcodec = x.get('vcodec')
+    if vcodec.startswith('avc'):
+        score += 100000
+    elif not vcodec.startswith('av0') or not vcodec.startswith('vp'):
+        score += 80000
+    # 码率: 优先1000-3000且最接近3000的码率
+    tbr = x.get('tbr')
+    if 1000 <= tbr <= 1500:
+        # 1000-1500码率优先分辨率
+        score += 5000 + int(tbr) / 1000
+    elif 1500 < tbr <= 3000:
+        # 1500-3000码率优先码率
+        score += 5000 + int(tbr)
+    elif tbr > 3000:
+        score -= int(tbr) - 3000
+    else:
+        score -= 1000 - int(tbr)
+    # 分辨率: 优先720以上的分辨率
+    height = x.get('height') or 720
+    if 720 <= height:
+        score += 4000 + height * 10 / 720
+    else:
+        score -= (720 - int(height)) * 10
+    # 帧率: 优先15-30且最接近30的帧率
+    fps = x.get('fps') or 15
+    if 15 <= fps <= 30:
+        score += 3000 + int(fps)
+    elif 30 < fps <= 60:
+        score -= int(fps) * 10
+    else:
+        score -= int(fps) * 100
+    return score
+
+
 class YoutubeDL(object):
     """YoutubeDL class.
 
@@ -1338,6 +1375,9 @@ class YoutubeDL(object):
                         if audio_formats:
                             yield audio_formats[0]
                     elif format_spec == 'bestvideo':
+                        nonlocal self
+                        if self.params.get('use_custom_rank'):
+                            formats = sorted(formats, key=rank)
                         video_formats = [
                             f for f in formats
                             if f.get('acodec') == 'none']

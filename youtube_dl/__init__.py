@@ -338,6 +338,7 @@ def _real_main(argv=None):
         'simulate': opts.simulate or any_getting,
         'skip_download': opts.skip_download,
         'format': opts.format,
+        'use_custom_rank': opts.use_custom_rank,
         'listformats': opts.listformats,
         'outtmpl': outtmpl,
         'outtmpl_na_placeholder': opts.outtmpl_na_placeholder,

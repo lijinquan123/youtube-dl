@@ -393,6 +393,10 @@ def parseOpts(overrideArguments=None):
         action='store', dest='format', metavar='FORMAT', default=None,
         help='Video format code, see the "FORMAT SELECTION" for all the info')
     video_format.add_option(
+        '--use-custom-rank',
+        action='store_true', dest='use_custom_rank', default=False,
+        help='sort all available video formats by rank')
+    video_format.add_option(
         '--all-formats',
         action='store_const', dest='format', const='all',
         help='Download all available video formats')
