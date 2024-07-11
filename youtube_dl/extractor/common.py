@@ -25,6 +25,7 @@ from ..compat import (
     compat_getpass,
     compat_integer_types,
     compat_http_client,
+    compat_kwargs,
     compat_map as map,
     compat_open as open,
     compat_os_name,
@@ -1102,6 +1103,60 @@ class InfoExtractor(object):
             self._downloader.report_warning('unable to extract %s' % _name + bug_reports_message())
             return None
 
+    def _search_json(self, start_pattern, string, name, video_id, **kwargs):
+        """Searches string for the JSON object specified by start_pattern"""
+
+        # self, start_pattern, string, name, video_id, *, end_pattern='',
+        # contains_pattern=r'{(?s:.+)}', fatal=True, default=NO_DEFAULT
+        # NB: end_pattern is only used to reduce the size of the initial match
+        end_pattern = kwargs.pop('end_pattern', '')
+        # (?:[\s\S]) simulates (?(s):.) (eg)
+        contains_pattern = kwargs.pop('contains_pattern', r'{[\s\S]+}')
+        fatal = kwargs.pop('fatal', True)
+        default = kwargs.pop('default', NO_DEFAULT)
+
+        if default is NO_DEFAULT:
+            default, has_default = {}, False
+        else:
+            fatal, has_default = False, True
+
+        json_string = self._search_regex(
+            r'(?:{0})\s*(?P<json>{1})\s*(?:{2})'.format(
+                start_pattern, contains_pattern, end_pattern),
+            string, name, group='json', fatal=fatal, default=None if has_default else NO_DEFAULT)
+        if not json_string:
+            return default
+
+        # yt-dlp has a special JSON parser that allows trailing text.
+        # Until that arrives here, the diagnostic from the exception
+        # raised by json.loads() is used to extract the wanted text.
+        # Either way, it's a problem if a transform_source() can't
+        # handle the trailing text.
+
+        # force an exception
+        kwargs['fatal'] = True
+
+        # self._downloader._format_err(name, self._downloader.Styles.EMPHASIS)
+        for _ in range(2):
+            try:
+                # return self._parse_json(json_string, video_id, ignore_extra=True, **kwargs)
+                transform_source = kwargs.pop('transform_source', None)
+                if transform_source:
+                    json_string = transform_source(json_string)
+                return self._parse_json(json_string, video_id, **compat_kwargs(kwargs))
+            except ExtractorError as e:
+                end = int_or_none(self._search_regex(r'\(char\s+(\d+)', error_to_compat_str(e), 'end', default=None))
+                if end is not None:
+                    json_string = json_string[:end]
+                    continue
+                msg = 'Unable to extract {0} - Failed to parse JSON'.format(name)
+                if fatal:
+                    raise ExtractorError(msg, cause=e.cause, video_id=video_id)
+                elif not has_default:
+                    self.report_warning(
+                        '{0}: {1}'.format(msg, error_to_compat_str(e)), video_id=video_id)
+            return default
+
     def _html_search_regex(self, pattern, string, name, default=NO_DEFAULT, fatal=True, flags=0, group=None):
         """
         Like _search_regex, but strips HTML tags and unescapes entities.
@@ -1114,10 +1169,10 @@ class InfoExtractor(object):
     def _get_netrc_login_info(self, netrc_machine=None):
         username = None
         password = None
-        netrc_machine = netrc_machine or self._NETRC_MACHINE
 
         if self._downloader.params.get('usenetrc', False):
             try:
+                netrc_machine = netrc_machine or self._NETRC_MACHINE
                 info = netrc.netrc().authenticators(netrc_machine)
                 if info is not None:
                     username = info[0]
@@ -1125,7 +1180,7 @@ class InfoExtractor(object):
                 else:
                     raise netrc.NetrcParseError(
                         'No authenticators for %s' % netrc_machine)
-            except (IOError, netrc.NetrcParseError) as err:
+            except (AttributeError, IOError, netrc.NetrcParseError) as err:
                 self._downloader.report_warning(
                     'parsing .netrc: %s' % error_to_compat_str(err))
 
@@ -1435,14 +1490,18 @@ class InfoExtractor(object):
         return dict((k, v) for k, v in info.items() if v is not None)
 
     def _search_nextjs_data(self, webpage, video_id, **kw):
-        nkw = dict((k, v) for k, v in kw.items() if k in ('transform_source', 'fatal'))
-        kw.pop('transform_source', None)
-        next_data = self._search_regex(
-            r'''<script[^>]+\bid\s*=\s*('|")__NEXT_DATA__\1[^>]*>(?P<nd>[^<]+)</script>''',
-            webpage, 'next.js data', group='nd', **kw)
-        if not next_data:
-            return {}
-        return self._parse_json(next_data, video_id, **nkw)
+        # ..., *, transform_source=None, fatal=True, default=NO_DEFAULT
+
+        # TODO: remove this backward compat
+        default = kw.get('default', NO_DEFAULT)
+        if default == '{}':
+            kw['default'] = {}
+            kw = compat_kwargs(kw)
+
+        return self._search_json(
+            r'''<script\s[^>]*?\bid\s*=\s*('|")__NEXT_DATA__\1[^>]*>''',
+            webpage, 'next.js data', video_id, end_pattern='</script>',
+            **kw)
 
     def _search_nuxt_data(self, webpage, video_id, *args, **kwargs):
         """Parses Nuxt.js metadata. This works as long as the function __NUXT__ invokes is a pure function"""
@@ -2966,25 +3025,21 @@ class InfoExtractor(object):
         return formats
 
     def _find_jwplayer_data(self, webpage, video_id=None, transform_source=js_to_json):
-        mobj = re.search(
-            r'''(?s)jwplayer\s*\(\s*(?P<q>'|")(?!(?P=q)).+(?P=q)\s*\)(?!</script>).*?\.\s*setup\s*\(\s*(?P<options>(?:\([^)]*\)|[^)])+)\s*\)''',
-            webpage)
-        if mobj:
-            try:
-                jwplayer_data = self._parse_json(mobj.group('options'),
-                                                 video_id=video_id,
-                                                 transform_source=transform_source)
-            except ExtractorError:
-                pass
-            else:
-                if isinstance(jwplayer_data, dict):
-                    return jwplayer_data
+        return self._search_json(
+            r'''(?<!-)\bjwplayer\s*\(\s*(?P<q>'|")(?!(?P=q)).+(?P=q)\s*\)(?:(?!</script>).)*?\.\s*(?:setup\s*\(|(?P<load>load)\s*\(\s*\[)''',
+            webpage, 'JWPlayer data', video_id,
+            # must be a {...} or sequence, ending
+            contains_pattern=r'\{[\s\S]*}(?(load)(?:\s*,\s*\{[\s\S]*})*)', end_pattern=r'(?(load)\]|\))',
+            transform_source=transform_source, default=None)
 
     def _extract_jwplayer_data(self, webpage, video_id, *args, **kwargs):
-        jwplayer_data = self._find_jwplayer_data(
-            webpage, video_id, transform_source=js_to_json)
-        return self._parse_jwplayer_data(
-            jwplayer_data, video_id, *args, **kwargs)
+        # allow passing `transform_source` through to _find_jwplayer_data()
+        transform_source = kwargs.pop('transform_source', None)
+        kwfind = compat_kwargs({'transform_source': transform_source}) if transform_source else {}
+
+        jwplayer_data = self._find_jwplayer_data(webpage, video_id, **kwfind)
+
+        return self._parse_jwplayer_data(jwplayer_data, video_id, *args, **kwargs)
 
     def _parse_jwplayer_data(self, jwplayer_data, video_id=None, require_title=True,
                              m3u8_id=None, mpd_id=None, rtmp_params=None, base_url=None):
@@ -3018,22 +3073,14 @@ class InfoExtractor(object):
                 mpd_id=mpd_id, rtmp_params=rtmp_params, base_url=base_url)
 
             subtitles = {}
-            tracks = video_data.get('tracks')
-            if tracks and isinstance(tracks, list):
-                for track in tracks:
-                    if not isinstance(track, dict):
-                        continue
-                    track_kind = track.get('kind')
-                    if not track_kind or not isinstance(track_kind, compat_str):
-                        continue
-                    if track_kind.lower() not in ('captions', 'subtitles'):
-                        continue
-                    track_url = urljoin(base_url, track.get('file'))
-                    if not track_url:
-                        continue
-                    subtitles.setdefault(track.get('label') or 'en', []).append({
-                        'url': self._proto_relative_url(track_url)
-                    })
+            for track in traverse_obj(video_data, (
+                    'tracks', lambda _, t: t.get('kind').lower() in ('captions', 'subtitles'))):
+                track_url = urljoin(base_url, track.get('file'))
+                if not track_url:
+                    continue
+                subtitles.setdefault(track.get('label') or 'en', []).append({
+                    'url': self._proto_relative_url(track_url)
+                })
 
             entry = {
                 'id': this_video_id,
@@ -3252,12 +3299,16 @@ class InfoExtractor(object):
         return ret
 
     @classmethod
-    def _merge_subtitles(cls, subtitle_dict1, subtitle_dict2):
-        """ Merge two subtitle dictionaries, language by language. """
-        ret = dict(subtitle_dict1)
-        for lang in subtitle_dict2:
-            ret[lang] = cls._merge_subtitle_items(subtitle_dict1.get(lang, []), subtitle_dict2[lang])
-        return ret
+    def _merge_subtitles(cls, subtitle_dict1, *subtitle_dicts, **kwargs):
+        """ Merge subtitle dictionaries, language by language. """
+
+        # ..., * , target=None
+        target = kwargs.get('target') or dict(subtitle_dict1)
+
+        for subtitle_dict in subtitle_dicts:
+            for lang in subtitle_dict:
+                target[lang] = cls._merge_subtitle_items(target.get(lang, []), subtitle_dict[lang])
+        return target
 
     def extract_automatic_captions(self, *args, **kwargs):
         if (self._downloader.params.get('writeautomaticsub', False)
@@ -3289,6 +3340,29 @@ class InfoExtractor(object):
 
     def _generic_title(self, url):
         return compat_urllib_parse_unquote(os.path.splitext(url_basename(url))[0])
+
+    def _yes_playlist(self, playlist_id, video_id, *args, **kwargs):
+        # smuggled_data=None, *, playlist_label='playlist', video_label='video'
+        smuggled_data = args[0] if len(args) == 1 else kwargs.get('smuggled_data')
+        playlist_label = kwargs.get('playlist_label', 'playlist')
+        video_label = kwargs.get('video_label', 'video')
+
+        if not playlist_id or not video_id:
+            return not video_id
+
+        no_playlist = (smuggled_data or {}).get('force_noplaylist')
+        if no_playlist is not None:
+            return not no_playlist
+
+        video_id = '' if video_id is True else ' ' + video_id
+        noplaylist = self.get_param('noplaylist')
+        self.to_screen(
+            'Downloading just the {0}{1} because of --no-playlist'.format(video_label, video_id)
+            if noplaylist else
+            'Downloading {0}{1} - add --no-playlist to download just the {2}{3}'.format(
+                playlist_label, '' if playlist_id is True else ' ' + playlist_id,
+                video_label, video_id))
+        return not noplaylist
 
 
 class SearchInfoExtractor(InfoExtractor):
